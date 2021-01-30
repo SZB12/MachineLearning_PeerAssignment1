@@ -1,0 +1,160 @@
+---
+title: "Machine Learning Course - Accelerometer Exercise Activity Classification Analysis"
+author: "XZB"
+geometry: left=1cm,right=1cm,top=0.8cm,bottom=0.8cm
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+fontsize: 10pt
+---
+## Executive Summary
+This project aims to predict how well participants in a dumbbell weight lifting study performed their exercise. Data was provided from multiple accelerometers attached to 6 participants who each did one set of 10 reps correctly one way and incorrectly four ways, as given by the 5 categories (A through E) in the `classe` variable in the training set. The training set was pre-processed to remove columns that are not predictors, remove variables that don't have enough data to function appropriately as predictors and lastly imputation was performed to fill in missing (NA) values. Once the training set was pre-processed, K-Fold partitioning was used for cross-validation to estimate out-of-sample error from a random forest classifier. The validation error from each fold was averaged to determine the estimate of the out-of-sample error rate to be around 0.0046. A random forest classifier on the training set is therefore satisfactory in this instance. Predictions are then made for the testing set, after pre-processing the testing set in the exact same way as for the training set. The random forest model correctly classifies all 20 observations in the testing set. 
+
+I would like to acknowledge the data comes from:
+
+http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+## Download Data
+Load the training and testing sets for the accelerometer data, look at the structure of the dataframes and explore the `classe` variable. 
+``` {r, cache=TRUE}
+# Load libraries 
+library(caret)
+library(RANN)
+library(ggplot2)
+library(ggrepel)
+library(randomForest)
+
+# Download training data
+webURLTrain <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+tempTrain <- tempfile()
+download.file(webURLTrain,tempTrain)
+training <- read.csv(tempTrain)
+unlink(tempTrain)
+
+# Examine structure of dataframe training
+str(training)
+str(training$classe)
+
+# Double check to make sure classe variable column contains no NA values
+which(is.na(training$classe))
+unique(training$classe)
+
+# Download testing data
+webURLTest <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+tempTest <- tempfile()
+download.file(webURLTest,tempTest)
+testing <- read.csv(tempTest)
+unlink(tempTest)
+
+```
+From above, there are five unique categories in the `classe` variable, therefore classifier models (as opposed to regularized regression models such as lasso or ridge) will be trained to predict the categories A, B, C, D or E. 
+
+## Pre-processing Data 
+
+It can be seen from the `str` function on the training set that some variables should be removed as they aren't predictors, such as user_name and the timestamps. Some columns also should be removed because they have no values that aid with prediction, e.g. some columns only have values "" or "#DIV/0!". 
+
+``` {r cache=TRUE}
+# By inspection, remove first 5 columns that aren't predictors from training and test
+training <- training[,-c(1,2,3,4,5)]
+testing <- testing[,-c(1,2,3,4,5)]
+
+# Identify columns that do not contain prediction information, e.g. columns that only contain 
+# " " or "#DIV/0!" and plot the number of unique values in each column
+col_uni <- apply(training,2,function(x) length(unique(x)))
+range(col_uni)
+col_uniDF <- as.data.frame(col_uni)
+col_uniDF$id <- seq(1,length(col_uni)) 
+ggplot(col_uniDF, aes(x=id, y=col_uni)) + geom_point() + scale_y_continuous(trans='log10') + geom_label_repel(data = subset(col_uniDF, col_uni < 20),aes(label = col_uni), segment.color = 'grey50') + xlab("Column Number") + ylab("Number of Unique Values in the Column (log10 Scale)") + ggtitle("Plot of Unique Values in each Column in the Training Set") 
+
+```
+
+From the above graph, it's apparent that there is a group of columns that have less than 5 unique values. The last column with 5 unique values is due to the 5 categories in the `classe` variable, so filter out any columns with 4 or fewer unique values.
+
+``` {r cache=TRUE}
+# From the graph, columns that have equal to or less than 4 unique values do not contain enough 
+# information to be useful for prediction  
+col_elim <- names(which(col_uni <= 4))
+training_elim <- training[,col_elim]
+
+# Confirm col_elim columns should be eliminated
+col_elimCheck <- apply(training_elim,2,unique)
+col_elimCheck
+
+# Eliminate col_elim columns from training and test set 
+training <- training[,-which(names(training) %in% col_elim)]
+testing <- testing[,-which(names(testing) %in% col_elim)]
+
+# Change "character" columns to type "numeric" for the training set
+charFind <- sapply(training,typeof)
+charFind_index <- names(which(charFind=="character"))
+trainingNum <- training
+
+# The last "classe" column should not be converted to numeric
+for (i in 1:(length(charFind_index)-1)){
+  trainingNum[,charFind_index[i]] <- as.numeric(trainingNum[,charFind_index[i]])
+}
+```
+
+Additionally, there many variables that contain NA values. Therefore, imputation needs to be done for the missing values. Impute the training set using the KNN algorithm so that it can be used for training a classifier.  
+
+``` {r cache=TRUE}
+# Use knn imputation for trainingNum dataframe
+preObj <- preProcess(trainingNum[,-ncol(trainingNum)], method = "knnImpute",k=10)
+procTraining <- predict(preObj,trainingNum[,-ncol(trainingNum)])
+
+# Add the 'classe' variable back to imputed training dataframe procTraining
+procTraining$classe <- training$classe
+```
+
+## Model Selection
+First, try a random forest algorithm. This decision is based on the fact that random forests generally perform quite well as a classifier algorithm. Since the testing data does not contain the `classe` variable, it cannot be used for getting an estimate of the out-of-sample error. Therefore folds are created in the training set to split the training set into both training and validation:
+``` {r,cache=TRUE}
+# Use K-Fold partitioning to split the training data into 10 folds
+folds <- createFolds(y=procTraining$classe,k=10,list=TRUE,returnTrain = TRUE)
+
+# Loop through training the data, leaving out one fold at a time as the cross validation set 
+set.seed(12)
+CM <- rep.int(0,10)
+for (i in 1:length(folds)){
+  modFit <- randomForest(x=procTraining[folds[[i]],1:(ncol(procTraining)-1)],
+                     y=factor(procTraining[folds[[i]],ncol(procTraining)]))
+  predictionRF <- predict(modFit,newdata=procTraining[-folds[[i]],1:(ncol(procTraining)-1)])
+  CM[i] <- confusionMatrix(as.factor(procTraining[-folds[[i]],ncol(procTraining)]),predictionRF)$overall[1]
+}
+
+mean(CM)
+
+```
+The vector `CM` = [`r CM`] contains the 10 out-of-sample accuracy estimates from K-Fold cross validation. 
+
+The estimate of the out-of-sample error is: 
+`1 - mean(CM)` = `r 1 - mean(CM)`
+
+## Prediction 
+
+Since the estimated out-of-sample error is very low using random forests, there is no need to use other algorithms such as boosting or any combinations of algorithms. First, pre-process the testing data following the same steps used to pre-process the training set. Then, predict the testing set using a random forest trained on the whole training set that has already been pre-processed. 
+
+``` {r,cache=TRUE}
+# Change "character" columns to type "numeric" for the testing set, however the last "problem_id" column should not be 
+# converted to numeric
+testingNum <- testing
+for (i in 1:(length(charFind_index)-1)){
+  testingNum[,charFind_index[i]] <- as.numeric(testingNum[,charFind_index[i]])
+}
+
+# Use same knn imputation for the testing set, based on the training data from before 
+procTesting <- predict(preObj,testingNum[,-ncol(testingNum)])
+
+# Use randomForest algorithm for entire training set and predict the true value of classe for the 20 testing observations
+modFit_train <- randomForest(x=procTraining[,1:(ncol(procTraining)-1)],
+                     y=factor(procTraining[,ncol(procTraining)]))
+predictionRF_test <- predict(modFit_train,newdata=procTesting[,1:(ncol(procTesting))])
+
+```
+The predicted `classe` variable for each of the 20 observations in the testing set is: 
+
+`r predictionRF_test`
+
+Based on the results from the course project prediction quiz, the results from `predictionRF_test` has 100% accuracy. 
